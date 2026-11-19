@@ -11,8 +11,6 @@ app.use(cors());
 app.use(express.json());
 
 
-
-
 // Create a MongoClient and connect it to mongodb
 const client = new MongoClient(process.env.MONGO_CLIENT_URI);
 export async function connectToMongodb() {
@@ -21,7 +19,8 @@ export async function connectToMongodb() {
     console.log("Successfully connected to mongodb");
     return client;
   } catch (err) {
-    console.log(err);
+    console.error("Failed to connect to mongodb:", err);
+    process.exit(1);
   }
 }
 const connectedClient = await connectToMongodb();
@@ -38,28 +37,28 @@ const transactions = db.collection('transactions')
 
 //add new data to items collection
 app.post('/items', async (req, res) => {
-  const newItem = req.body;
-  const result = await items.insertOne(newItems);
-  res.send(result)
+  try {
+    const newItem = req.body;
+    const result = await items.insertOne(newItem);
+    res.send(result)
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(err.message)
+  }
 })
 
-//add new data to items collection
-app.post('/items', async (req, res) => {
-  const newItem = req.body;
-  const result = await items.insertOne(newItems);
-  res.send(result)
-})
-
-//display all or query filtered data from jobs collection
+//display all or query filtered data from items collection
 app.get('/items', async (req, res) => {
-  const query={};
-  const cursor = items.find(query);
-  const result = await cursor.toArray();
-  res.send(result)
+  try {
+    const query = {};
+    const cursor = items.find(query);
+    const result = await cursor.toArray();
+    res.send(result)
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(err.message)
+  }
 })
-
-
-
 
 
 //homepage of backend
