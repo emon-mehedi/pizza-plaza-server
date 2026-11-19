@@ -61,6 +61,17 @@ app.get('/items', async (req, res) => {
 })
 
 
+//place a new order
+app.post('/orders', async (req, res) => {
+  try {
+    const result = await orders.insertOne(req.body);
+    res.send(result)
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(err.message)
+  }
+})
+
 //homepage of backend
 app.get('/', (req, res) => {
   res.send("Welcome to the backend of PizzaPlaza")
