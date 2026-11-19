@@ -72,6 +72,20 @@ app.post('/orders', async (req, res) => {
   }
 })
 
+//display orders, optionally filtered by customerId or vendorId
+app.get('/orders', async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.customerId) query.customerId = req.query.customerId;
+    if (req.query.vendorId) query.vendorId = req.query.vendorId;
+    const result = await orders.find(query).sort({ createdAt: -1 }).toArray();
+    res.send(result)
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(err.message)
+  }
+})
+
 //homepage of backend
 app.get('/', (req, res) => {
   res.send("Welcome to the backend of PizzaPlaza")
