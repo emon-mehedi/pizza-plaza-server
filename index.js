@@ -63,6 +63,21 @@ const items = db.collection("items"); // "menuItems" in the requirements
 const orders = db.collection("orders");
 const transactions = db.collection("transactions");
 
+// Indexes for the queries the app runs most often. Startup still works if an
+// old database cannot build one (for example, because of duplicate keys).
+try {
+  await Promise.all([
+    items.createIndex({ vendorId: 1, status: 1 }),
+    items.createIndex({ status: 1, createdAt: -1 }),
+    orders.createIndex({ customerId: 1, createdAt: -1 }),
+    orders.createIndex({ vendorId: 1, status: 1 }),
+    transactions.createIndex({ vendorId: 1, createdAt: -1 }),
+    transactions.createIndex({ stripeSessionId: 1 }),
+  ]);
+} catch (error) {
+  console.warn("Could not create some indexes:", error.message);
+}
+
 // Stripe is optional locally: without keys, payment routes return a clear 503.
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
@@ -106,6 +121,35 @@ const cleanPrice = (value) => {
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const toPublicItem = (doc) => ({ ...doc, _id: doc._id.toString(), id: doc._id.toString() });
+
+// Attach a small item snapshot to orders so the UI can show a name/image even
+// if the item was later rejected or deleted. Stored orders are not changed.
+async function addItemSnapshots(orderList) {
+  const ids = orderList.map((order) => order.itemId).filter(isObjectId);
+  const related = ids.length
+    ? await items.find({ _id: { $in: ids.map((id) => new ObjectId(id)) } }).toArray()
+    : [];
+  const itemMap = new Map(related.map((item) => [item._id.toString(), item]));
+
+  return orderList.map((order) => {
+    const item = itemMap.get(order.itemId);
+    return {
+      ...order,
+      _id: order._id.toString(),
+      id: order._id.toString(),
+      item: item
+        ? {
+            _id: item._id.toString(),
+            itemName: item.itemName,
+            images: item.images,
+            price: item.price,
+            category: item.category,
+            location: item.location,
+          }
+        : null,
+    };
+  });
+}
 
 const hasPremium = (user) => {
   if (user.subscriptionPlan !== "premium") return false;
@@ -504,26 +548,23 @@ app.get("/orders", requireAuth, asyncRoute(async (req, res) => {
   if (ORDER_STATUSES.includes(req.query.status)) query.status = req.query.status;
 
   const list = await orders.find(query).sort({ createdAt: -1 }).toArray();
+  res.json(await addItemSnapshots(list));
+}));
 
-  // Attach a small item snapshot so the UI can show a name/image even if the
-  // item was later rejected or removed. The stored order is not modified.
-  const ids = list.map((order) => order.itemId).filter(isObjectId);
-  const related = ids.length
-    ? await items.find({ _id: { $in: ids.map((id) => new ObjectId(id)) } }).toArray()
-    : [];
-  const itemMap = new Map(related.map((item) => [item._id.toString(), item]));
+// GET /orders/:id — one order with its item snapshot. Ownership is checked.
+app.get("/orders/:id", requireAuth, asyncRoute(async (req, res) => {
+  const order = await orders.findOne(byId(req.params.id));
+  if (!order) throw new HttpError(404, "Order not found.");
 
-  res.json(list.map((order) => {
-    const item = itemMap.get(order.itemId);
-    return {
-      ...order,
-      _id: order._id.toString(),
-      id: order._id.toString(),
-      item: item
-        ? { _id: item._id.toString(), itemName: item.itemName, images: item.images, price: item.price, category: item.category, location: item.location }
-        : null,
-    };
-  }));
+  if (req.user.role === "customer" && order.customerId !== req.user.id) {
+    throw new HttpError(403, "This is not your order.");
+  }
+  if (req.user.role === "vendor" && order.vendorId !== req.user.id) {
+    throw new HttpError(403, "This order is not for your restaurant.");
+  }
+
+  const [result] = await addItemSnapshots([order]);
+  res.json(result);
 }));
 
 // PATCH /orders/:id/status — vendor accepts/rejects, customer cancels.
