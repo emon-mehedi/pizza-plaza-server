@@ -61,6 +61,25 @@ app.get('/items', async (req, res) => {
 })
 
 
+//display a single item by id
+app.get('/items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const query = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { id };
+    const result = await items.findOne(query);
+
+    if (!result) {
+      return res.status(404).send({ message: 'Item not found' });
+    }
+
+    res.send(result)
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(err.message)
+  }
+})
+
+
 //place a new order
 app.post('/orders', async (req, res) => {
   try {
