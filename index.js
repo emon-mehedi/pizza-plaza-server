@@ -156,6 +156,7 @@ async function requireAuth(req, res, next) {
       role: user.role,
       businessName: user.businessName,
       subscriptionPlan: user.subscriptionPlan ?? "free",
+      subscriptionExpiresAt: user.subscriptionExpiresAt ?? null,
       isPremium: hasPremium(user),
     };
     return next();
@@ -332,7 +333,58 @@ app.delete("/items/:id", requireAuth, asyncRoute(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
-// 8. Admin menu + users
+// 8. Dashboard overview numbers
+// ---------------------------------------------------------------------------
+
+// GET /admin/overview — the numbers shown on the admin dashboard.
+app.get("/admin/overview", requireAuth, requireRole("admin"), asyncRoute(async (req, res) => {
+  const [totalUsers, totalVendors, totalCustomers, totalItems, pendingItems, totalTransactions] =
+    await Promise.all([
+      users.countDocuments({}),
+      users.countDocuments({ role: "vendor" }),
+      users.countDocuments({ role: "customer" }),
+      items.countDocuments({}),
+      items.countDocuments({ status: "pending" }),
+      transactions.countDocuments({}),
+    ]);
+
+  res.json({ totalUsers, totalVendors, totalCustomers, totalItems, pendingItems, totalTransactions });
+}));
+
+// GET /vendor/overview — numbers for the signed-in vendor only.
+app.get("/vendor/overview", requireAuth, requireRole("vendor"), asyncRoute(async (req, res) => {
+  const [totalMenuItems, activeMenuItems, pendingOrders, acceptedOrders] = await Promise.all([
+    items.countDocuments({ vendorId: req.user.id }),
+    items.countDocuments({ vendorId: req.user.id, status: "approved" }),
+    orders.countDocuments({ vendorId: req.user.id, status: "pending" }),
+    orders.countDocuments({ vendorId: req.user.id, status: "accepted" }),
+  ]);
+
+  res.json({
+    totalMenuItems,
+    activeMenuItems,
+    pendingOrders,
+    acceptedOrders,
+    subscriptionPlan: req.user.subscriptionPlan,
+    subscriptionExpiresAt: req.user.subscriptionExpiresAt,
+    isPremium: req.user.isPremium,
+  });
+}));
+
+// GET /customer/overview — order counts for the signed-in customer only.
+app.get("/customer/overview", requireAuth, requireRole("customer"), asyncRoute(async (req, res) => {
+  const [totalOrders, pendingOrders, acceptedOrders, rejectedOrders] = await Promise.all([
+    orders.countDocuments({ customerId: req.user.id }),
+    orders.countDocuments({ customerId: req.user.id, status: "pending" }),
+    orders.countDocuments({ customerId: req.user.id, status: "accepted" }),
+    orders.countDocuments({ customerId: req.user.id, status: "rejected" }),
+  ]);
+
+  res.json({ totalOrders, pendingOrders, acceptedOrders, rejectedOrders });
+}));
+
+// ---------------------------------------------------------------------------
+// 9. Admin menu + users
 // ---------------------------------------------------------------------------
 
 // GET /admin/items — every submitted item, with filters.
@@ -398,7 +450,7 @@ app.patch("/users/:id/block", requireAuth, requireRole("admin"), asyncRoute(asyn
 }));
 
 // ---------------------------------------------------------------------------
-// 9. Orders
+// 10. Orders
 // ---------------------------------------------------------------------------
 
 // POST /orders — customers only. The server decides who the customer is and
@@ -496,7 +548,7 @@ app.patch("/orders/:id/status", requireAuth, asyncRoute(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
-// 10. Transactions + Stripe subscription payment
+// 11. Transactions + Stripe subscription payment
 // ---------------------------------------------------------------------------
 
 // GET /transactions — admin only. Records are read-only: no edit/delete route.
@@ -609,7 +661,7 @@ async function handleStripeWebhook(req, res) {
 }
 
 // ---------------------------------------------------------------------------
-// 11. 404 + central error handler
+// 12. 404 + central error handler
 // ---------------------------------------------------------------------------
 
 app.use((req, res) => {
