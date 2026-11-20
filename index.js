@@ -35,6 +35,7 @@ const CATEGORIES = [
 ];
 const ITEM_STATUSES = ["pending", "approved", "rejected", "inactive"];
 const ORDER_STATUSES = ["pending", "accepted", "rejected", "cancelled"];
+const TRANSACTION_STATUSES = ["pending", "succeeded", "failed"];
 const FREE_ITEM_LIMIT = 3;
 const PREMIUM_PRICE_CENTS = 999; // $9.99 — change here if you want a different price
 const PREMIUM_CURRENCY = "usd";
@@ -121,6 +122,51 @@ const cleanPrice = (value) => {
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const toPublicItem = (doc) => ({ ...doc, _id: doc._id.toString(), id: doc._id.toString() });
+
+// One safe user shape shared by the user list and the user detail page.
+// Never spread a raw Better Auth document — it contains password hashes.
+const toPublicUser = (user) => ({
+  id: user._id.toString(),
+  name: user.name,
+  email: user.email,
+  image: user.image,
+  role: user.role,
+  isBlocked: Boolean(user.isBlocked),
+  businessName: user.businessName,
+  subscriptionPlan: user.subscriptionPlan ?? "free",
+  subscriptionExpiresAt: user.subscriptionExpiresAt,
+  createdAt: user.createdAt,
+});
+
+// Attach the vendor's basic details to a transaction row so the transactions
+// page can show who paid without a second request.
+async function addVendorInfo(rows) {
+  const ids = [...new Set(rows.map((row) => row.vendorId).filter(Boolean))];
+  const vendors = ids.length
+    ? await users.find({
+        _id: { $in: ids.map((id) => (isObjectId(id) ? new ObjectId(id) : id)) },
+      }).toArray()
+    : [];
+
+  const vendorMap = new Map();
+  for (const vendor of vendors) {
+    const publicVendor = {
+      id: vendor._id.toString(),
+      name: vendor.name,
+      email: vendor.email,
+      businessName: vendor.businessName,
+    };
+    vendorMap.set(vendor._id.toString(), publicVendor);
+    if (typeof vendor.id === "string") vendorMap.set(vendor.id, publicVendor);
+  }
+
+  return rows.map((row) => ({
+    ...row,
+    _id: row._id.toString(),
+    id: row._id.toString(),
+    vendor: vendorMap.get(row.vendorId) ?? null,
+  }));
+}
 
 // Attach a small item snapshot to orders so the UI can show a name/image even
 // if the item was later rejected or deleted. Stored orders are not changed.
@@ -499,18 +545,32 @@ app.get("/users", requireAuth, requireRole("admin"), asyncRoute(async (req, res)
   if (["vendor", "customer", "admin"].includes(req.query.role)) query.role = req.query.role;
 
   const list = await users.find(query).sort({ createdAt: -1 }).toArray();
-  res.json(list.map((user) => ({
-    id: user._id.toString(),
-    name: user.name,
-    email: user.email,
-    image: user.image,
-    role: user.role,
-    isBlocked: Boolean(user.isBlocked),
-    businessName: user.businessName,
-    subscriptionPlan: user.subscriptionPlan ?? "free",
-    subscriptionExpiresAt: user.subscriptionExpiresAt,
-    createdAt: user.createdAt,
-  })));
+  res.json(list.map(toPublicUser));
+}));
+
+// GET /admin/users/:id — one user plus a few numbers for the detail view.
+app.get("/admin/users/:id", requireAuth, requireRole("admin"), asyncRoute(async (req, res) => {
+  const user = await users.findOne(byId(req.params.id));
+  if (!user) throw new HttpError(404, "User not found.");
+
+  const userId = user._id.toString();
+  const isBuyer = user.role === "customer";
+  const orderQuery = isBuyer ? { customerId: userId } : { vendorId: userId };
+
+  const [itemCount, orderCount, successfulPayments, recentOrders] = await Promise.all([
+    user.role === "vendor" ? items.countDocuments({ vendorId: userId }) : 0,
+    orders.countDocuments(orderQuery),
+    user.role === "vendor"
+      ? transactions.countDocuments({ vendorId: userId, status: "succeeded" })
+      : 0,
+    orders.find(orderQuery).sort({ createdAt: -1 }).limit(5).toArray(),
+  ]);
+
+  res.json({
+    ...toPublicUser(user),
+    stats: { itemCount, orderCount, successfulPayments },
+    recentOrders: await addItemSnapshots(recentOrders),
+  });
 }));
 
 // PATCH /users/:id/block — optional admin feature, kept small and safe.
@@ -624,11 +684,50 @@ app.patch("/orders/:id/status", requireAuth, asyncRoute(async (req, res) => {
 // ---------------------------------------------------------------------------
 
 // GET /transactions — admin only. Records are read-only: no edit/delete route.
+// Supports status, vendor, name/email search and a createdAt date range.
 app.get("/transactions", requireAuth, requireRole("admin"), asyncRoute(async (req, res) => {
   const query = {};
-  if (typeof req.query.vendorId === "string" && req.query.vendorId) query.vendorId = req.query.vendorId;
+  if (TRANSACTION_STATUSES.includes(req.query.status)) query.status = req.query.status;
+
+  const vendorId = typeof req.query.vendorId === "string" ? req.query.vendorId.trim() : "";
+  const search = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  let allowedVendorIds = null;
+
+  if (search) {
+    const pattern = new RegExp(escapeRegex(search), "i");
+    const matched = await users.find(
+      { $or: [{ name: pattern }, { email: pattern }, { businessName: pattern }] },
+      { projection: { _id: 1 } }
+    ).toArray();
+    allowedVendorIds = matched.map((vendor) => vendor._id.toString());
+  }
+  if (vendorId) {
+    allowedVendorIds = allowedVendorIds
+      ? allowedVendorIds.filter((id) => id === vendorId)
+      : [vendorId];
+  }
+  if (allowedVendorIds) query.vendorId = { $in: allowedVendorIds };
+
+  const from = typeof req.query.from === "string" ? Date.parse(req.query.from) : NaN;
+  const to = typeof req.query.to === "string" ? Date.parse(req.query.to) : NaN;
+  if (Number.isFinite(from) || Number.isFinite(to)) {
+    query.createdAt = {};
+    if (Number.isFinite(from)) query.createdAt.$gte = new Date(from);
+    if (Number.isFinite(to)) query.createdAt.$lte = new Date(to);
+  }
+
   const list = await transactions.find(query).sort({ createdAt: -1 }).toArray();
-  res.json(list.map((row) => ({ ...row, _id: row._id.toString() })));
+  res.json(await addVendorInfo(list));
+}));
+
+// GET /vendor/transactions — a vendor sees only its own payment history.
+// The vendorId is taken from the JWT, never from the query string.
+app.get("/vendor/transactions", requireAuth, requireRole("vendor"), asyncRoute(async (req, res) => {
+  const query = { vendorId: req.user.id };
+  if (TRANSACTION_STATUSES.includes(req.query.status)) query.status = req.query.status;
+
+  const list = await transactions.find(query).sort({ createdAt: -1 }).toArray();
+  res.json(await addVendorInfo(list));
 }));
 
 // POST /payments/checkout — creates a Stripe Checkout session for THIS vendor.
