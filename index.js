@@ -243,7 +243,8 @@ app.get("/", (req, res) => {
 });
 
 // GET /items?q=&category=&location=&minPrice=&maxPrice=&sort=price_asc
-// Used by the home page and Browse Menu. Only approved items are returned.
+// GET /items?featured=1&limit=6 — premium vendors first (home page).
+// Only approved items are returned.
 app.get("/items", asyncRoute(async (req, res) => {
   const query = { status: "approved" };
 
@@ -264,6 +265,36 @@ app.get("/items", asyncRoute(async (req, res) => {
   const maxPrice = Number(req.query.maxPrice);
   if (Number.isFinite(minPrice) && req.query.minPrice !== undefined && req.query.minPrice !== "") query.price = { ...query.price, $gte: minPrice };
   if (Number.isFinite(maxPrice) && req.query.maxPrice !== undefined && req.query.maxPrice !== "") query.price = { ...query.price, $lte: maxPrice };
+
+  // The home page wants a small featured selection. Items from vendors with
+  // an active Premium plan come first; everything else is newest first.
+  if (req.query.featured === "1" || req.query.featured === "true") {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 6, 1), 12);
+    const now = new Date().toISOString();
+
+    const premiumVendors = await users
+      .find({
+        subscriptionPlan: "premium",
+        $or: [
+          { subscriptionExpiresAt: { $exists: false } },
+          { subscriptionExpiresAt: null },
+          { subscriptionExpiresAt: { $gt: now } },
+        ],
+      })
+      .project({ _id: 1 })
+      .toArray();
+    const premiumIds = new Set(premiumVendors.map((vendor) => vendor._id.toString()));
+
+    const list = await items.find(query).toArray();
+    list.sort((a, b) => {
+      const aPremium = premiumIds.has(a.vendorId) ? 1 : 0;
+      const bPremium = premiumIds.has(b.vendorId) ? 1 : 0;
+      if (aPremium !== bPremium) return bPremium - aPremium;
+      return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+    });
+
+    return res.json(list.slice(0, limit).map(toPublicItem));
+  }
 
   let cursor = items.find(query);
   if (req.query.sort === "price_asc") cursor = cursor.sort({ price: 1 });
