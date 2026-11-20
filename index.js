@@ -203,6 +203,23 @@ const hasPremium = (user) => {
   return new Date(user.subscriptionExpiresAt).getTime() > Date.now();
 };
 
+// A premium plan can expire while nobody is signed in. Downgrade it the next
+// time we see that user, so every protected route uses the same rule.
+async function expirePremiumIfNeeded(user) {
+  if (user.subscriptionPlan !== "premium" || !user.subscriptionExpiresAt) return false;
+
+  const expiresAt = new Date(user.subscriptionExpiresAt).getTime();
+  if (!Number.isFinite(expiresAt) || expiresAt > Date.now()) return false;
+
+  await users.updateOne(
+    { _id: user._id },
+    { $set: { subscriptionPlan: "free", subscriptionExpiresAt: null } }
+  );
+  user.subscriptionPlan = "free";
+  user.subscriptionExpiresAt = null;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // 4. Authentication and role middleware
 // ---------------------------------------------------------------------------
@@ -228,14 +245,7 @@ async function requireAuth(req, res, next) {
     if (user.isBlocked) return res.status(403).json({ message: "This account is blocked." });
 
     // A premium subscription can expire. Downgrade once, then treat as free.
-    if (user.subscriptionPlan === "premium" && user.subscriptionExpiresAt &&
-        new Date(user.subscriptionExpiresAt).getTime() <= Date.now()) {
-      await users.updateOne(
-        { _id: user._id },
-        { $set: { subscriptionPlan: "free", subscriptionExpiresAt: null } }
-      );
-      user.subscriptionPlan = "free";
-    }
+    await expirePremiumIfNeeded(user);
 
     // Only safe values go on req.user. Roles never come from the request body.
     req.user = {
@@ -779,6 +789,8 @@ app.get("/payments/session/:sessionId", requireAuth, requireRole("vendor"), asyn
 
 // POST /payments/webhook — Stripe calls this. Premium is activated HERE only,
 // after Stripe's signature is verified. The success redirect is never trusted.
+// The important safety rule: each checkout session can activate a plan ONCE,
+// even if Stripe retries or delivers the same event twice.
 async function handleStripeWebhook(req, res) {
   if (!process.env.STRIPE_WEBHOOK_SECRET || !stripe) {
     return res.status(503).json({ message: "Webhook is not configured." });
@@ -796,38 +808,97 @@ async function handleStripeWebhook(req, res) {
     return res.status(400).json({ message: "Invalid webhook signature." });
   }
 
-  if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
-    const session = event.data.object;
-    if (session.payment_status === "paid") {
-      const vendorId = session.metadata?.vendorId || session.client_reference_id;
-      const vendor = vendorId ? await users.findOne(byId(vendorId)) : null;
+  const succeeded =
+    event.type === "checkout.session.completed" ||
+    event.type === "checkout.session.async_payment_succeeded";
+  const failed =
+    event.type === "checkout.session.expired" ||
+    event.type === "checkout.session.async_payment_failed";
 
-      if (vendor) {
-        const expiresAt = new Date(Date.now() + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1000);
-        await transactions.updateOne(
-          { stripeSessionId: session.id },
-          {
-            $set: {
-              status: "succeeded",
-              stripeSubscriptionId: session.subscription ?? null,
-            },
-          }
-        );
-        await users.updateOne(
-          { _id: vendor._id },
-          { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: expiresAt.toISOString() } }
-        );
-      }
+  if (!succeeded && !failed) {
+    return res.json({ received: true, ignored: event.type });
+  }
+
+  const session = event.data?.object ?? {};
+  if (!session.id) {
+    return res.status(400).json({ message: "Webhook event is missing a session id." });
+  }
+
+  if (succeeded) {
+    // Ignore anything that is not our paid, one-time Premium checkout.
+    if (session.object !== "checkout.session" || session.mode !== "payment") {
+      return res.json({ received: true, ignored: "not_a_payment_session" });
     }
-  }
+    if (session.payment_status !== "paid") {
+      return res.json({ received: true, ignored: "not_paid_yet" });
+    }
 
-  if (event.type === "checkout.session.expired" || event.type === "checkout.session.async_payment_failed") {
-    await transactions.updateOne(
-      { stripeSessionId: event.data.object.id },
-      { $set: { status: "failed" } }
+    const metadataVendorId = session.metadata?.vendorId;
+    const vendorId = metadataVendorId || session.client_reference_id;
+    if (!vendorId) {
+      return res.status(400).json({ message: "Webhook event is missing a vendor reference." });
+    }
+    if (metadataVendorId && session.client_reference_id && metadataVendorId !== session.client_reference_id) {
+      return res.status(400).json({ message: "Vendor references do not match." });
+    }
+    if (Number.isFinite(Number(session.amount_total)) &&
+        Number(session.amount_total) !== PREMIUM_PRICE_CENTS) {
+      return res.status(400).json({ message: "Unexpected payment amount." });
+    }
+    if (session.currency && String(session.currency).toLowerCase() !== PREMIUM_CURRENCY) {
+      return res.status(400).json({ message: "Unexpected payment currency." });
+    }
+
+    const vendor = await users.findOne(byId(vendorId));
+    if (!vendor) {
+      return res.json({ received: true, ignored: "unknown_vendor" });
+    }
+
+    const expiresAt = new Date(Date.now() + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1000);
+    const claimed = await transactions.findOneAndUpdate(
+      { stripeSessionId: session.id, status: { $ne: "succeeded" } },
+      {
+        $set: {
+          status: "succeeded",
+          stripeSubscriptionId: session.subscription ?? null,
+          stripeEventId: event.id,
+          paidAt: new Date(),
+          expiresAt: expiresAt.toISOString(),
+        },
+      },
+      { returnDocument: "after" }
     );
+
+    // A duplicate or out-of-order event finds nothing to claim. Do not extend
+    // the subscription or overwrite the transaction in that case.
+    if (!claimed) {
+      return res.json({ received: true, alreadyProcessed: true });
+    }
+
+    await expirePremiumIfNeeded(vendor);
+    const current = vendor.subscriptionExpiresAt
+      ? new Date(vendor.subscriptionExpiresAt).getTime()
+      : 0;
+    const start = Number.isFinite(current) && current > Date.now() ? current : Date.now();
+    const finalExpiresAt = new Date(start + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1000);
+
+    await users.updateOne(
+      { _id: vendor._id },
+      { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: finalExpiresAt.toISOString() } }
+    );
+    await transactions.updateOne(
+      { _id: claimed._id },
+      { $set: { expiresAt: finalExpiresAt.toISOString() } }
+    );
+
+    return res.json({ received: true, activated: true });
   }
 
+  // A failed/expired session must never overwrite a payment that already won.
+  await transactions.updateOne(
+    { stripeSessionId: session.id, status: "pending" },
+    { $set: { status: "failed", stripeEventId: event.id, failedAt: new Date() } }
+  );
   return res.json({ received: true });
 }
 
