@@ -220,6 +220,60 @@ async function expirePremiumIfNeeded(user) {
   return true;
 }
 
+/**
+ * Claim a paid one-time Premium Checkout Session and upgrade the vendor.
+ * Shared by the Stripe webhook and the success-page verification path so both
+ * follow the same rules. The status guard makes it safe to call from either:
+ * the first caller claims the session, later callers become a no-op.
+ * Callers must validate the session (paid, amount, currency, vendor) first.
+ */
+async function activatePremiumFromSession(session, eventId = null) {
+  const vendorId = session.metadata?.vendorId || session.client_reference_id;
+  if (!vendorId) return { error: "Webhook event is missing a vendor reference." };
+
+  const vendor = await users.findOne(byId(vendorId));
+  if (!vendor) return { ignored: "unknown_vendor" };
+
+  const provisionalExpiry = new Date(
+    Date.now() + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1000
+  );
+  const claimed = await transactions.findOneAndUpdate(
+    { stripeSessionId: session.id, status: { $ne: "succeeded" } },
+    {
+      $set: {
+        status: "succeeded",
+        stripeSubscriptionId: session.subscription ?? null,
+        ...(eventId ? { stripeEventId: eventId } : {}),
+        paidAt: new Date(),
+        expiresAt: provisionalExpiry.toISOString(),
+      },
+    },
+    { returnDocument: "after" }
+  );
+
+  // A duplicate or out-of-order event finds nothing to claim. Do not extend
+  // the subscription or overwrite the transaction in that case.
+  if (!claimed) return { alreadyProcessed: true };
+
+  await expirePremiumIfNeeded(vendor);
+  const current = vendor.subscriptionExpiresAt
+    ? new Date(vendor.subscriptionExpiresAt).getTime()
+    : 0;
+  const start = Number.isFinite(current) && current > Date.now() ? current : Date.now();
+  const finalExpiresAt = new Date(start + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1000);
+
+  await users.updateOne(
+    { _id: vendor._id },
+    { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: finalExpiresAt.toISOString() } }
+  );
+  await transactions.updateOne(
+    { _id: claimed._id },
+    { $set: { expiresAt: finalExpiresAt.toISOString() } }
+  );
+
+  return { activated: true, expiresAt: finalExpiresAt.toISOString() };
+}
+
 // ---------------------------------------------------------------------------
 // 4. Authentication and role middleware
 // ---------------------------------------------------------------------------
@@ -747,7 +801,6 @@ app.post("/payments/checkout", requireAuth, requireRole("vendor"), asyncRoute(as
 
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
-    payment_method_types: ["card"],
     line_items: [{
       price_data: {
         currency: PREMIUM_CURRENCY,
@@ -777,20 +830,57 @@ app.post("/payments/checkout", requireAuth, requireRole("vendor"), asyncRoute(as
   res.json({ url: session.url, sessionId: session.id });
 }));
 
-// GET /payments/session/:sessionId — the success page can check the result.
+// GET /payments/session/:sessionId — the success page checks the result here.
+// The webhook is the primary activation path, but locally (or if the webhook is
+// missed) the customer can reach this route while the transaction is still
+// pending. Re-check the session with Stripe and claim it with the same guard
+// the webhook uses, so the two paths can never activate a plan twice.
 app.get("/payments/session/:sessionId", requireAuth, requireRole("vendor"), asyncRoute(async (req, res) => {
   const row = await transactions.findOne({
     stripeSessionId: req.params.sessionId,
     vendorId: req.user.id,
   });
   if (!row) throw new HttpError(404, "Payment session not found.");
-  res.json({ status: row.status, plan: row.plan, isPremium: req.user.isPremium });
+
+  let status = row.status;
+  let isPremium = req.user.isPremium;
+  let subscriptionExpiresAt = req.user.subscriptionExpiresAt ?? null;
+
+  if (status !== "succeeded" && stripe) {
+    const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
+
+    if (session.status === "complete" && session.payment_status === "paid") {
+      if (session.object !== "checkout.session" || session.mode !== "payment") {
+        throw new HttpError(400, "Unexpected payment session.");
+      }
+      const vendorRef = session.metadata?.vendorId || session.client_reference_id;
+      if (vendorRef && vendorRef !== req.user.id) {
+        throw new HttpError(403, "This payment belongs to a different vendor.");
+      }
+      if (Number.isFinite(Number(session.amount_total)) &&
+          Number(session.amount_total) !== PREMIUM_PRICE_CENTS) {
+        throw new HttpError(400, "Unexpected payment amount.");
+      }
+      if (session.currency && String(session.currency).toLowerCase() !== PREMIUM_CURRENCY) {
+        throw new HttpError(400, "Unexpected payment currency.");
+      }
+
+      const result = await activatePremiumFromSession(session);
+      if (result.error) throw new HttpError(400, result.error);
+
+      const updatedUser = await users.findOne(byId(req.user.id));
+      status = "succeeded";
+      isPremium = updatedUser ? hasPremium(updatedUser) : true;
+      subscriptionExpiresAt = updatedUser?.subscriptionExpiresAt ?? result.expiresAt ?? null;
+    }
+  }
+
+  res.json({ status, plan: row.plan, isPremium, subscriptionExpiresAt });
 }));
 
-// POST /payments/webhook — Stripe calls this. Premium is activated HERE only,
-// after Stripe's signature is verified. The success redirect is never trusted.
-// The important safety rule: each checkout session can activate a plan ONCE,
-// even if Stripe retries or delivers the same event twice.
+// POST /payments/webhook — Stripe calls this. Premium is activated after the
+// signature is verified. The success-page check uses the same activation
+// helper; a checkout session can activate a plan ONCE, whichever path wins.
 async function handleStripeWebhook(req, res) {
   if (!process.env.STRIPE_WEBHOOK_SECRET || !stripe) {
     return res.status(503).json({ message: "Webhook is not configured." });
@@ -849,47 +939,16 @@ async function handleStripeWebhook(req, res) {
       return res.status(400).json({ message: "Unexpected payment currency." });
     }
 
-    const vendor = await users.findOne(byId(vendorId));
-    if (!vendor) {
-      return res.json({ received: true, ignored: "unknown_vendor" });
+    const result = await activatePremiumFromSession(session, event.id);
+    if (result.error) {
+      return res.status(400).json({ message: result.error });
     }
-
-    const expiresAt = new Date(Date.now() + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1000);
-    const claimed = await transactions.findOneAndUpdate(
-      { stripeSessionId: session.id, status: { $ne: "succeeded" } },
-      {
-        $set: {
-          status: "succeeded",
-          stripeSubscriptionId: session.subscription ?? null,
-          stripeEventId: event.id,
-          paidAt: new Date(),
-          expiresAt: expiresAt.toISOString(),
-        },
-      },
-      { returnDocument: "after" }
-    );
-
-    // A duplicate or out-of-order event finds nothing to claim. Do not extend
-    // the subscription or overwrite the transaction in that case.
-    if (!claimed) {
+    if (result.ignored) {
+      return res.json({ received: true, ignored: result.ignored });
+    }
+    if (result.alreadyProcessed) {
       return res.json({ received: true, alreadyProcessed: true });
     }
-
-    await expirePremiumIfNeeded(vendor);
-    const current = vendor.subscriptionExpiresAt
-      ? new Date(vendor.subscriptionExpiresAt).getTime()
-      : 0;
-    const start = Number.isFinite(current) && current > Date.now() ? current : Date.now();
-    const finalExpiresAt = new Date(start + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1000);
-
-    await users.updateOne(
-      { _id: vendor._id },
-      { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: finalExpiresAt.toISOString() } }
-    );
-    await transactions.updateOne(
-      { _id: claimed._id },
-      { $set: { expiresAt: finalExpiresAt.toISOString() } }
-    );
 
     return res.json({ received: true, activated: true });
   }
@@ -927,5 +986,5 @@ app.use((error, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PizzaHub API listening on port ${PORT}`);
+  console.log(`PizzaPlaza API listening on port ${PORT}`);
 });
